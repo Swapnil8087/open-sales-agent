@@ -1,7 +1,13 @@
+pub mod audio;
+pub mod engine;
+pub mod recorder;
+pub mod stt;
+pub mod session;
 pub mod storage;
 pub mod window;
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -116,6 +122,72 @@ fn toggle_bar(app: &AppHandle) {
     }
 }
 
+#[derive(Default)]
+struct RecorderState(Mutex<Option<recorder::Recorder>>);
+
+#[derive(serde::Serialize)]
+struct SttStatus {
+    ready: bool,
+    message: Option<String>,
+}
+
+fn stt_status_inner() -> Result<stt::WhisperCli, String> {
+    let bin = stt::first_existing(&stt::whisper_bin_candidates())
+        .ok_or("Whisper engine not installed. Run: brew install whisper-cpp")?;
+    let model = stt::model_path().ok_or("Cannot resolve app data directory")?;
+    if !model.is_file() {
+        return Err(format!("Whisper model missing. Place {} at {}", stt::MODEL_FILE, model.display()));
+    }
+    Ok(stt::WhisperCli::new(bin, model))
+}
+
+#[tauri::command]
+fn stt_status() -> SttStatus {
+    match stt_status_inner() {
+        Ok(_) => SttStatus { ready: true, message: None },
+        Err(m) => SttStatus { ready: false, message: Some(m) },
+    }
+}
+
+#[tauri::command]
+fn start_recording(app: AppHandle, state: tauri::State<RecorderState>) -> Result<(), String> {
+    let mut slot = state.0.lock().unwrap();
+    if slot.is_some() {
+        return Ok(());
+    }
+    let whisper = stt_status_inner()?;
+    let tmp = std::env::temp_dir().join(format!("open-sales-agent-{}", std::process::id()));
+    let engine = Arc::new(engine::Engine::new(Arc::new(whisper), tmp));
+    let emit: engine::Emit = Arc::new(move |e| match e {
+        engine::Event::Level(v) => {
+            let _ = app.emit("audio:level", v);
+        }
+        engine::Event::Partial(t) => {
+            let _ = app.emit("transcript:partial", t);
+        }
+        engine::Event::Final(t) => {
+            let _ = app.emit("transcript:final", t);
+        }
+        engine::Event::Error(m) => {
+            let _ = app.emit("transcript:error", m);
+        }
+    });
+    *slot = Some(recorder::Recorder::start(engine, emit)?);
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_recording(state: tauri::State<'_, RecorderState>) -> Result<String, String> {
+    let rec = state.0.lock().unwrap().take();
+    match rec {
+        // The final whisper pass can take a moment; keep it off the UI thread.
+        Some(r) => tauri::async_runtime::spawn_blocking(move || r.stop())
+            .await
+            .map_err(|e| e.to_string()),
+        None => Ok(String::new()),
+    }
+}
+
 #[tauri::command]
 fn hide_window(app: AppHandle) {
     hide_bar(&app);
@@ -147,7 +219,14 @@ pub fn run() {
                 })
                 .build(),
         )
-        .invoke_handler(tauri::generate_handler![hide_window, open_data_folder])
+        .manage(RecorderState::default())
+        .invoke_handler(tauri::generate_handler![
+            hide_window,
+            open_data_folder,
+            stt_status,
+            start_recording,
+            stop_recording
+        ])
         .on_window_event(|window, event| {
             // Spotlight-style: clicking elsewhere dismisses the bar.
             if let WindowEvent::Focused(false) = event
