@@ -13,3 +13,14 @@ export const resizeBar = (height: number) =>
 
 /** Fires each time the hotkey/tray shows the bar. Returns an unlisten fn. */
 export const onBarShown = async (cb: () => void) => listen("bar:shown", cb);
+
+export const startRecording = () => invoke<void>("start_recording");
+/** Stops the mic, runs the final pass and resolves with the full transcript. */
+export const stopRecording = () => invoke<string>("stop_recording");
+
+export const onAudioLevel = (cb: (level: number) => void) =>
+  listen<number>("audio:level", (e) => cb(e.payload));
+export const onPartialTranscript = (cb: (text: string) => void) =>
+  listen<string>("transcript:partial", (e) => cb(e.payload));
+export const onTranscriptError = (cb: (msg: string) => void) =>
+  listen<string>("transcript:error", (e) => cb(e.payload));
