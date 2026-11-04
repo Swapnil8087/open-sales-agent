@@ -12,6 +12,34 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 pub const DEFAULT_HOTKEY: &str = "Alt+Space";
 const BAR_LABEL: &str = "main";
 
+#[cfg(target_os = "macos")]
+tauri_nspanel::tauri_panel! {
+    panel!(BarPanel {
+        config: {
+            can_become_key_window: true,
+            is_floating_panel: true
+        }
+    })
+}
+
+/// Turn the Tauri window into a non-activating panel so it can float over
+/// fullscreen apps and every Space, like Spotlight.
+#[cfg(target_os = "macos")]
+fn make_panel(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri_nspanel::{CollectionBehavior, PanelLevel, StyleMask, WebviewWindowExt};
+    let win = bar(app).ok_or("main window missing")?;
+    let panel = win.to_panel::<BarPanel>()?;
+    panel.set_level(PanelLevel::Status.value());
+    panel.add_style_mask(StyleMask::empty().nonactivating_panel().into())?;
+    panel.set_collection_behavior(
+        CollectionBehavior::new()
+            .full_screen_auxiliary()
+            .can_join_all_spaces()
+            .into(),
+    );
+    Ok(())
+}
+
 /// Provision the data directory on boot. Returns the root that was prepared.
 pub fn init_storage(root: Option<PathBuf>) -> std::io::Result<PathBuf> {
     let root = root
@@ -58,8 +86,18 @@ fn position_bar(app: &AppHandle, win: &WebviewWindow) {
 fn show_bar(app: &AppHandle) {
     if let Some(win) = bar(app) {
         position_bar(app, &win);
-        let _ = win.show();
-        let _ = win.set_focus();
+        #[cfg(target_os = "macos")]
+        {
+            use tauri_nspanel::ManagerExt;
+            if let Ok(p) = app.get_webview_panel(BAR_LABEL) {
+                p.show_and_make_key();
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
         let _ = app.emit("bar:shown", ());
     }
 }
@@ -96,7 +134,10 @@ fn open_data_folder() -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_nspanel::init());
+    builder
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
@@ -120,6 +161,8 @@ pub fn run() {
 
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            #[cfg(target_os = "macos")]
+            make_panel(app.handle())?;
 
             let show = MenuItem::with_id(app, "show", "Show Open Sales Agent", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
