@@ -16,8 +16,12 @@ pub enum Event {
 
 pub type Emit = Arc<dyn Fn(Event) + Send + Sync>;
 
+const MIN_SPEECH_LEVEL: f32 = 0.1; // about -45 dBFS RMS
+const SILENT: &str = "No sound detected from the microphone. Check System Settings > Privacy & Security > Microphone and your input device.";
+
 #[derive(Default)]
 struct State {
+    warned_silent: bool,
     seg_start: usize,
     last_attempt: usize,
     committed: String,
@@ -49,6 +53,11 @@ impl Engine {
 
     fn transcribe_range(&self, from: usize, to: usize) -> Result<String, String> {
         let seg: Vec<i16> = self.samples.lock().unwrap()[from..to].to_vec();
+        // Whisper hallucinates ("you you you") on silence, so don't feed it silence.
+        let f: Vec<f32> = seg.iter().map(|v| *v as f32 / 32768.0).collect();
+        if audio::level(&f) < MIN_SPEECH_LEVEL {
+            return Err(SILENT.to_string());
+        }
         std::fs::create_dir_all(&self.tmp_dir).map_err(|e| e.to_string())?;
         let wav = self.tmp_dir.join("segment.wav");
         audio::write_wav(&wav, &seg)?;
@@ -79,6 +88,7 @@ impl Engine {
         match self.transcribe_range(seg_start, total) {
             Ok(text) => {
                 let mut st = self.state.lock().unwrap();
+                st.warned_silent = false;
                 if step == Step::Commit {
                     st.committed = join(&st.committed, &text);
                     st.seg_start = total;
@@ -87,8 +97,21 @@ impl Engine {
                     emit(Event::Partial(join(&st.committed, &text)));
                 }
             }
-            Err(e) => emit(Event::Error(e)),
+            Err(e) => self.report(e, emit),
         }
+    }
+
+    /// Silence is reported once per quiet stretch instead of every tick.
+    fn report(&self, e: String, emit: &dyn Fn(Event)) {
+        let mut st = self.state.lock().unwrap();
+        if e == SILENT {
+            if st.warned_silent {
+                return;
+            }
+            st.warned_silent = true;
+        }
+        drop(st);
+        emit(Event::Error(e));
     }
 
     /// Transcribe whatever is left and return the full text.
@@ -99,7 +122,7 @@ impl Engine {
         if total.saturating_sub(seg_start) >= SR / 4 {
             match self.transcribe_range(seg_start, total) {
                 Ok(t) => text = t,
-                Err(e) => emit(Event::Error(e)),
+                Err(e) => self.report(e, emit),
             }
         }
         let full = join(&self.state.lock().unwrap().committed, &text);
@@ -195,6 +218,34 @@ mod tests {
         e.push(&loud(3));
         e.tick(&emit);
         assert!(matches!(ev.lock().unwrap()[0], Event::Error(_)));
+    }
+
+    #[test]
+    fn silent_audio_never_reaches_whisper_and_explains_why() {
+        let (e, f, _d) = engine(false);
+        let (ev, emit) = collect();
+        e.push(&vec![0i16; 3 * SR]);
+        e.tick(&emit);
+        e.push(&vec![0i16; 3 * SR]);
+        e.tick(&emit);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+        let evs = ev.lock().unwrap();
+        assert_eq!(evs.len(), 1, "warn once, not every tick: {evs:?}");
+        assert!(matches!(&evs[0], Event::Error(m) if m.contains("No sound")));
+        drop(evs);
+        assert_eq!(e.finish(&emit), "");
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn speech_after_silence_is_transcribed() {
+        let (e, f, _d) = engine(false);
+        let (_ev, emit) = collect();
+        e.push(&vec![0i16; 3 * SR]);
+        e.tick(&emit);
+        e.push(&loud(3));
+        e.tick(&emit);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

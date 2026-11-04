@@ -3,7 +3,7 @@
 use crate::audio::{self, Resampler, SAMPLE_RATE};
 use crate::engine::{Emit, Engine, Event};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -24,6 +24,12 @@ fn open_stream(
     let cfg = dev.default_input_config().map_err(|e| e.to_string())?;
     let channels = cfg.channels() as usize;
     let rate = cfg.sample_rate();
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[mic] device={:?} rate={rate} channels={channels} format={:?}",
+        dev.description().map(|d| d.to_string()).unwrap_or_default(),
+        cfg.sample_format()
+    );
     let mut rs = Resampler::new(rate, SAMPLE_RATE);
     let err_fn = |e| eprintln!("audio stream error: {e}");
     let mut handle = move |mono: Vec<f32>| {
@@ -68,14 +74,17 @@ impl Recorder {
     pub fn start(engine: Arc<Engine>, emit: Emit) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+        let peak = Arc::new(AtomicU32::new(0)); // debug diagnostics only
 
         // cpal streams are !Send, so the stream lives and dies on this thread.
         let mic_thread = {
-            let (engine, emit, stop) = (engine.clone(), emit.clone(), stop.clone());
+            let (engine, emit, stop, peak) = (engine.clone(), emit.clone(), stop.clone(), peak.clone());
             std::thread::spawn(move || {
                 let eng = engine.clone();
                 let em = emit.clone();
                 let stream = open_stream(move |mono| {
+                    let p = mono.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    peak.fetch_max(p.to_bits(), Ordering::Relaxed); // non-negative floats order like their bits
                     em(Event::Level(audio::level(&mono)));
                     eng.push(&audio::f32_to_i16(&mono));
                 });
@@ -96,10 +105,16 @@ impl Recorder {
         ready_rx.recv().map_err(|e| e.to_string())??;
 
         let worker = {
-            let (engine, emit, stop) = (engine.clone(), emit.clone(), stop.clone());
+            let (engine, emit, stop, peak) = (engine.clone(), emit.clone(), stop.clone(), peak.clone());
             std::thread::spawn(move || {
+                let mut n = 0u32;
                 while !stop.load(Ordering::SeqCst) {
                     engine.tick(&*emit);
+                    n += 1;
+                    if cfg!(debug_assertions) && n.is_multiple_of(5) {
+                        let p = f32::from_bits(peak.swap(0, Ordering::Relaxed));
+                        eprintln!("[mic] {:.1}s recorded, peak={p:.4}", engine.seconds_recorded());
+                    }
                     std::thread::sleep(Duration::from_millis(400));
                 }
             })

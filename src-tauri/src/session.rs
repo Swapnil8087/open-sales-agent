@@ -45,7 +45,11 @@ pub fn clean_transcript(raw: &str) -> String {
         }
     }
     out.push_str(rest);
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Classic whisper hallucination on near-silence: nothing but "you".
+    let only_you = !out.is_empty()
+        && out.split_whitespace().all(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).eq_ignore_ascii_case("you"));
+    if only_you { String::new() } else { out }
 }
 
 #[cfg(test)]
@@ -86,6 +90,10 @@ mod tests {
         assert_eq!(clean_transcript("[BLANK_AUDIO]"), "");
         assert_eq!(clean_transcript(" Hello [Music] world (silence) "), "Hello world");
         assert_eq!(clean_transcript("line one\n  line two\n"), "line one line two");
+        assert_eq!(clean_transcript("you you you"), "");
+        assert_eq!(clean_transcript(" You. You. "), "");
+        assert_eq!(clean_transcript("Thank you."), "Thank you.");
+        assert_eq!(clean_transcript("Are you in?"), "Are you in?");
         assert_eq!(clean_transcript("Budget is (about) 5 crore"), "Budget is (about) 5 crore");
     }
 }
