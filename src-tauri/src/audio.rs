@@ -24,39 +24,88 @@ pub fn level(samples: &[f32]) -> f32 {
     if rms <= 0.0 {
         return 0.0;
     }
-    // -50 dBFS..0 dBFS -> 0..1
-    ((20.0 * rms.log10() + 50.0) / 50.0).clamp(0.0, 1.0)
+    // -60 dBFS..-10 dBFS -> 0..1 (laptop mics are quiet; keep the meter lively)
+    ((20.0 * rms.log10() + 60.0) / 50.0).clamp(0.0, 1.0)
 }
 
 pub fn f32_to_i16(samples: &[f32]) -> Vec<i16> {
     samples.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i16).collect()
 }
 
-/// Stateful linear resampler; feeding chunks equals feeding the whole signal.
+/// Stateful windowed-sinc resampler. Low-passes below the output Nyquist so
+/// downsampling (48k -> 16k) does not alias into the voice band. Feeding chunks
+/// equals feeding the whole signal.
 pub struct Resampler {
     step: f64,
+    cutoff: f64, // cycles per input sample
+    half: usize, // kernel half-width in input samples
     pos: f64,
     pending: Vec<f32>,
 }
 
 impl Resampler {
     pub fn new(from_hz: u32, to_hz: u32) -> Self {
-        Self { step: from_hz as f64 / to_hz as f64, pos: 0.0, pending: Vec::new() }
+        let ratio = (to_hz as f64 / from_hz as f64).min(1.0);
+        let cutoff = 0.5 * ratio * if ratio < 1.0 { 0.95 } else { 1.0 };
+        let half = (8.0 / (2.0 * cutoff)).ceil() as usize;
+        Self {
+            step: from_hz as f64 / to_hz as f64,
+            cutoff,
+            half,
+            pos: half as f64,
+            pending: vec![0.0; half], // zero history so output 0 aligns with input 0
+        }
+    }
+
+    fn weight(&self, x: f64) -> f64 {
+        let h = self.half as f64;
+        if x.abs() >= h {
+            return 0.0;
+        }
+        let a = 2.0 * self.cutoff * x;
+        let sinc = if a.abs() < 1e-12 { 1.0 } else { (std::f64::consts::PI * a).sin() / (std::f64::consts::PI * a) };
+        let window = 0.5 + 0.5 * (std::f64::consts::PI * x / h).cos();
+        2.0 * self.cutoff * sinc * window
     }
 
     pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
         self.pending.extend_from_slice(input);
         let mut out = Vec::with_capacity((input.len() as f64 / self.step) as usize + 1);
-        while self.pos + 1.0 < self.pending.len() as f64 {
-            let i = self.pos as usize;
-            let frac = (self.pos - i as f64) as f32;
-            out.push(self.pending[i] * (1.0 - frac) + self.pending[i + 1] * frac);
+        while self.pos + (self.half as f64) < self.pending.len() as f64 {
+            let i0 = self.pos as usize;
+            let (mut acc, mut wsum) = (0.0f64, 0.0f64);
+            for k in (i0 + 1 - self.half)..=(i0 + self.half) {
+                let w = self.weight(k as f64 - self.pos);
+                acc += self.pending[k] as f64 * w;
+                wsum += w;
+            }
+            out.push((acc / wsum) as f32); // unit DC gain
             self.pos += self.step;
         }
-        let drop = (self.pos as usize).min(self.pending.len());
+        let drop = (self.pos as usize).saturating_sub(self.half);
         self.pending.drain(..drop);
         self.pos -= drop as f64;
         out
+    }
+}
+
+/// Largest absolute sample value.
+pub fn peak(samples: &[i16]) -> u16 {
+    samples.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0)
+}
+
+/// Scale quiet audio up to a healthy level (gain capped) so whisper hears it.
+pub fn normalize(samples: &mut [i16]) {
+    let p = peak(samples);
+    if p == 0 {
+        return;
+    }
+    let gain = (26_000.0 / p as f32).min(40.0);
+    if gain <= 1.0 {
+        return;
+    }
+    for v in samples.iter_mut() {
+        *v = (*v as f32 * gain).round().clamp(-32767.0, 32767.0) as i16;
     }
 }
 
@@ -92,6 +141,7 @@ mod tests {
         let quiet = level(&[0.01; 100]);
         let loud = level(&[0.3; 100]);
         assert!(quiet > 0.0 && quiet < loud);
+        assert!(quiet > 0.3, "quiet speech should still move the meter: {quiet}");
         assert!(level(&[5.0; 100]) <= 1.0);
     }
 
@@ -104,8 +154,51 @@ mod tests {
     fn resampler_48k_to_16k_length_and_dc() {
         let mut r = Resampler::new(48_000, 16_000);
         let out = r.process(&vec![0.5; 4800]);
-        assert!((out.len() as i64 - 1600).abs() <= 1, "len {}", out.len());
-        assert!(out.iter().all(|v| (v - 0.5).abs() < 1e-6));
+        assert!((out.len() as i64 - 1600).abs() <= 40, "len {}", out.len());
+        // ignore the filter's start-up transient
+        assert!(out[40..].iter().all(|v| (v - 0.5).abs() < 1e-3));
+    }
+
+    fn rms_of(v: &[f32]) -> f32 {
+        (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
+    }
+
+    fn tone(hz: f32, rate: f32, n: usize) -> Vec<f32> {
+        (0..n).map(|i| (2.0 * std::f32::consts::PI * hz * i as f32 / rate).sin()).collect()
+    }
+
+    #[test]
+    fn resampler_removes_frequencies_above_nyquist_instead_of_aliasing() {
+        // 12 kHz is far above the 8 kHz Nyquist of 16 kHz output.
+        let out = Resampler::new(48_000, 16_000).process(&tone(12_000.0, 48_000.0, 9600));
+        assert!(rms_of(&out[100..]) < 0.05, "aliased energy {}", rms_of(&out[100..]));
+    }
+
+    #[test]
+    fn resampler_keeps_speech_band_energy() {
+        let out = Resampler::new(48_000, 16_000).process(&tone(1_000.0, 48_000.0, 9600));
+        let r = rms_of(&out[100..]);
+        assert!((r - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.05, "rms {r}");
+    }
+
+    #[test]
+    fn normalize_boosts_quiet_audio_but_not_silence() {
+        let mut quiet: Vec<i16> = (0..1000).map(|i| if i % 2 == 0 { 800 } else { -800 }).collect();
+        normalize(&mut quiet);
+        let peak = quiet.iter().map(|v| v.unsigned_abs()).max().unwrap();
+        assert!(peak > 24_000 && peak <= 32_767, "peak {peak}");
+        let mut silent = vec![0i16; 100];
+        normalize(&mut silent);
+        assert!(silent.iter().all(|v| *v == 0));
+        let mut tiny = vec![3i16, -3, 3];
+        normalize(&mut tiny); // gain is capped so noise is not blown up
+        assert!(tiny.iter().all(|v| v.abs() <= 3 * 40));
+    }
+
+    #[test]
+    fn peak_reports_largest_magnitude() {
+        assert_eq!(peak(&[0, -500, 300]), 500);
+        assert_eq!(peak(&[]), 0);
     }
 
     #[test]
@@ -125,10 +218,12 @@ mod tests {
 
     #[test]
     fn resampler_same_rate_is_passthrough_ish() {
-        let sig = vec![0.1, 0.2, 0.3, 0.4, 0.5];
+        let sig: Vec<f32> = (0..200).map(|i| (i as f32 * 0.05).sin()).collect();
         let out = Resampler::new(16_000, 16_000).process(&sig);
-        assert_eq!(&out[..], &sig[..out.len()]);
-        assert!(out.len() >= 4);
+        assert!(out.len() >= 150);
+        for (a, b) in out.iter().zip(&sig) {
+            assert!((a - b).abs() < 1e-4);
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub enum Event {
 
 pub type Emit = Arc<dyn Fn(Event) + Send + Sync>;
 
-const MIN_SPEECH_LEVEL: f32 = 0.1; // about -45 dBFS RMS
+const MIN_PEAK: u16 = 200; // ~ -44 dBFS; a muted/denied mic delivers exactly 0
 const SILENT: &str = "No sound detected from the microphone. Check System Settings > Privacy & Security > Microphone and your input device.";
 
 #[derive(Default)]
@@ -52,12 +52,12 @@ impl Engine {
     }
 
     fn transcribe_range(&self, from: usize, to: usize) -> Result<String, String> {
-        let seg: Vec<i16> = self.samples.lock().unwrap()[from..to].to_vec();
+        let mut seg: Vec<i16> = self.samples.lock().unwrap()[from..to].to_vec();
         // Whisper hallucinates ("you you you") on silence, so don't feed it silence.
-        let f: Vec<f32> = seg.iter().map(|v| *v as f32 / 32768.0).collect();
-        if audio::level(&f) < MIN_SPEECH_LEVEL {
+        if audio::peak(&seg) < MIN_PEAK {
             return Err(SILENT.to_string());
         }
+        audio::normalize(&mut seg); // quiet laptop mics transcribe far better when boosted
         std::fs::create_dir_all(&self.tmp_dir).map_err(|e| e.to_string())?;
         let wav = self.tmp_dir.join("segment.wav");
         audio::write_wav(&wav, &seg)?;
@@ -70,7 +70,7 @@ impl Engine {
         let s = self.samples.lock().unwrap();
         let from = total.saturating_sub(SR / 2);
         let tail: Vec<f32> = s[from..total].iter().map(|v| *v as f32 / 32768.0).collect();
-        audio::level(&tail) < 0.25
+        audio::level(&tail) < 0.2
     }
 
     /// One scheduling step; call periodically while recording.
@@ -145,13 +145,16 @@ mod tests {
     struct Fake {
         calls: AtomicUsize,
         lens: Mutex<Vec<usize>>,
+        peaks: Mutex<Vec<u16>>,
         fail: bool,
     }
     impl Transcriber for Fake {
         fn transcribe(&self, wav: &Path) -> Result<String, SttError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-            let len = hound::WavReader::open(wav).unwrap().len() as usize;
-            self.lens.lock().unwrap().push(len);
+            let mut rd = hound::WavReader::open(wav).unwrap();
+            self.lens.lock().unwrap().push(rd.len() as usize);
+            let data: Vec<i16> = rd.samples::<i16>().map(|s| s.unwrap()).collect();
+            self.peaks.lock().unwrap().push(audio::peak(&data));
             if self.fail {
                 return Err(SttError::Failed("boom".into()));
             }
@@ -160,7 +163,7 @@ mod tests {
     }
 
     fn engine(fail: bool) -> (Engine, Arc<Fake>, tempfile::TempDir) {
-        let f = Arc::new(Fake { calls: AtomicUsize::new(0), lens: Mutex::new(vec![]), fail });
+        let f = Arc::new(Fake { calls: AtomicUsize::new(0), lens: Mutex::new(vec![]), peaks: Mutex::new(vec![]), fail });
         let d = tempfile::tempdir().unwrap();
         (Engine::new(f.clone(), d.path().join("tmp")), f, d)
     }
@@ -235,6 +238,16 @@ mod tests {
         drop(evs);
         assert_eq!(e.finish(&emit), "");
         assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn quiet_speech_is_transcribed_and_boosted() {
+        let (e, f, _d) = engine(false);
+        let (_ev, emit) = collect();
+        e.push(&vec![900i16; 3 * SR]); // peak ~0.027, like the real laptop mic
+        e.tick(&emit);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        assert!(f.peaks.lock().unwrap()[0] > 20_000);
     }
 
     #[test]
