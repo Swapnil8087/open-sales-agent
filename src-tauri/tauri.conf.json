@@ -12,14 +12,26 @@
   "app": {
     "windows": [
       {
-        "title": "scaf",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "Open Sales Agent",
+        "width": 680,
+        "height": 140,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visible": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": false,
+        "visibleOnAllWorkspaces": true,
+        "focus": true
       }
     ],
     "security": {
-      "csp": null
-    }
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:11434; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
+      "devCsp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:11434 ws://localhost:1420 http://localhost:1420; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self' 'unsafe-inline'"
+    },
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,
